@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="initial-scale=1.0, user-scalable=no"/>
+    <!-- Removed hardcoded API key and will load it dynamically -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/3.5.5/d3.min.js"></script>
+    <script src="hexbin.js"></script>
+
+    <style>
+        html, body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+
+        .container {
+            display: flex;
+            width: 100%;
+            height: 100%;
+        }
+
+        #map {
+            width: 75%;
+            height: 100%;
+        }
+
+        #info-panel {
+            width: 25%;
+            height: 100%;
+            padding: 20px;
+            box-sizing: border-box;
+            background-color: #f5f5f5;
+            overflow-y: auto;
+        }
+
+        .info-content {
+            margin-bottom: 20px;
+        }
+
+        .info-title {
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: #333;
+        }
+
+        .airport-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+
+        .airport-item {
+            padding: 8px 0;
+            border-bottom: 1px solid #ddd;
+        }
+
+        .stations, 
+        .stations svg {
+            position: absolute;
+        }
+
+        .stations svg {
+            width: 60px;
+            height: 20px;
+            padding-right: 100px;
+            font: 10px sans-serif;
+        }
+
+        .hexagon {
+            cursor: pointer;
+            pointer-events: all;
+        }
+
+        .stations {
+            pointer-events: none;
+        }
+        
+        svg.hex {
+            pointer-events: none;
+        }
+
+        .stations circle {
+            fill: brown;
+            stroke: black;
+            stroke-width: 1.5px;
+        }
+
+        .selected-hexagon {
+            stroke: #000 !important;
+            stroke-width: 2px !important;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div id="map"></div>
+        <div id="info-panel">
+            <div class="info-content">
+                <div class="info-title">Selected Area</div>
+                <div id="selected-info">
+                    Hover over a colored hexagon to see airport information.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Load API key from config file
+        fetch('config.json')
+            .then(response => response.json())
+            .then(config => {
+                // Create script element for Google Maps API
+                const googleMapsScript = document.createElement('script');
+                googleMapsScript.src = `https://maps.googleapis.com/maps/api/js?key=${config.googleMapsApiKey}`;
+                googleMapsScript.async = true;
+                googleMapsScript.defer = true;
+                
+                // Once the API is loaded, initialize the map
+                googleMapsScript.onload = initializeMap;
+                document.head.appendChild(googleMapsScript);
+            })
+            .catch(error => {
+                console.error('Error loading configuration:', error);
+                document.getElementById('map').innerHTML = 
+                    '<div style="padding: 20px; text-align: center;">Error loading Google Maps. Please check your configuration.</div>';
+            });
+
+        function initializeMap() {
+            let hexagons;
+            let selectedHexagon = null;
+            
+            const map = new google.maps.Map(d3.select("#map").node(), {
+                zoom: 10,
+                center: new google.maps.LatLng(0, 0),
+                mapTypeId: google.maps.MapTypeId.TERRAIN
+            });
+
+            const infoPanel = d3.select("#selected-info");
+
+            function updateInfoPanel(data) {
+                if (!data || !data.containedPoints || !data.containedPoints.length) {
+                    infoPanel.html("Hover over a colored hexagon to see airport information.");
+                    return;
+                }
+
+                const airports = data.containedPoints
+                    .filter(p => !p.isBackground && p.data)
+                    .map(p => p.data);
+
+                if (airports.length === 0) {
+                    infoPanel.html("No airports in this area.");
+                    return;
+                }
+
+                const html = `
+                    <ul class="airport-list">
+                        ${airports.map(airport => `
+                            <li class="airport-item">
+                                <strong>${airport.key}</strong>
+                                ${airport.value[3] ? `<br>Value: ${airport.value[3][0]}` : ''}
+                            </li>
+                        `).join('')}
+                    </ul>
+                `;
+
+                infoPanel.html(html);
+            }
+
+            d3.json("stations.json", function(data) {
+                const bounds = new google.maps.LatLngBounds();
+                
+                d3.entries(data).forEach(function(d) {
+                    bounds.extend(new google.maps.LatLng(d.value[1], d.value[0]));
+                });
+                
+                map.setCenter(bounds.getCenter());
+                map.fitBounds(bounds);
+
+                google.maps.event.addListenerOnce(map, 'bounds_changed', function() {
+                    if (map.getZoom() > 15) map.setZoom(15);
+                    if (map.getZoom() < 5) map.setZoom(5);
+                });
+
+                const overlay = new google.maps.OverlayView();
+                let zoomTimer = null;
+                let lastZoom = 10;
+
+                overlay.onAdd = function() {
+                    const layer = d3.select(this.getPanes().overlayMouseTarget)
+                        .append("div")
+                        .attr("class", "stations");
+
+                    const hexRadius = 18;
+                    const hexPad = 100;
+                    let currentZoom = null;
+                    let hexbins = null;
+                    let svg = null;
+                    let container = null;
+
+                    function clearMap() {
+                        d3.select(overlay.getPanes().overlayMouseTarget)
+                            .html("");
+                        
+                        hexbins = null;
+                        svg = null;
+                        container = null;
+                        
+                        d3.select(overlay.getPanes().overlayMouseTarget)
+                            .append("div")
+                            .attr("class", "stations");
+                    }
+
+                    function initializeSvg() {
+                        d3.select(overlay.getPanes().overlayMouseTarget)
+                            .selectAll("svg.hex")
+                            .remove();
+                        
+                        svg = d3.select(overlay.getPanes().overlayMouseTarget)
+                            .append('svg')
+                            .attr("class", "hex")
+                            .style("overflow", "visible");
+                        
+                        container = svg.append("g");
+                        return container;
+                    }
+
+                    // Rest of the helper functions remain the same
+                    function generateHexagonGrid(bounds, projection) {
+                        const ne = bounds.getNorthEast();
+                        const sw = bounds.getSouthWest();
+                        
+                        const zoom = map.getZoom();
+                        const zoomingIn = zoom > lastZoom;
+                        
+                        const paddingFactor = zoomingIn ? 0.3 : 0.3;
+                        const overlapFactor = zoomingIn ? 1.1 : 4.9;
+                        
+                        const latPadding = (ne.lat() - sw.lat()) * paddingFactor;
+                        const lngPadding = (ne.lng() - sw.lng()) * paddingFactor;
+                        
+                        const dx = (hexRadius * 2 * Math.sin(Math.PI / 3)) / overlapFactor;
+                        const dy = (hexRadius * 1.5) / overlapFactor;
+                        
+                        const centerPixel = projection.fromLatLngToDivPixel(bounds.getCenter());
+                        const rightPixel = new google.maps.Point(centerPixel.x + dx, centerPixel.y);
+                        const bottomPixel = new google.maps.Point(centerPixel.x, centerPixel.y + dy);
+                        
+                        const rightLatLng = projection.fromDivPixelToLatLng(rightPixel);
+                        const bottomLatLng = projection.fromDivPixelToLatLng(bottomPixel);
+                        
+                        const lngStep = Math.abs(rightLatLng.lng() - bounds.getCenter().lng());
+                        const latStep = Math.abs(bottomLatLng.lat() - bounds.getCenter().lat());
+                        
+                        const grid = [];
+                        
+                        for (let lat = sw.lat() - latPadding; lat <= ne.lat() + latPadding; lat += latStep) {
+                            const row = Math.floor((lat - sw.lat()) / latStep);
+                            const offset = (row % 1) * (lngStep / 1);
+                            
+                            for (let lng = sw.lng() - lngPadding; lng <= ne.lng() + lngPadding; lng += lngStep) {
+                                grid.push({
+                                    latLng: new google.maps.LatLng(lat, lng + offset),
+                                    isBackground: true
+                                });
+                            }
+                        }
+                        
+                        d3.entries(data).forEach(function(d) {
+                            grid.push({
+                                latLng: new google.maps.LatLng(d.value[1], d.value[0]),
+                                data: d,
+                                isBackground: false
+                            });
+                        });
+                        
+                        return grid;
+                    }
+
+                    function createHexbins(points, projection) {
+                        const layout = d3.hexbin().radius(hexRadius);
+                        const pixelPoints = points.map(function(point) {
+                            const pixel = projection.fromLatLngToDivPixel(point.latLng);
+                            return [pixel.x, pixel.y, point];
+                        });
+                        
+                        const bins = layout(pixelPoints);
+                        bins.forEach(function(bin) {
+                            const centerPixel = new google.maps.Point(bin.x, bin.y);
+                            bin.geoCenter = projection.fromDivPixelToLatLng(centerPixel);
+                            bin.containedPoints = bin.map(function(p) { return p[2]; });
+                        });
+                        
+                        return bins;
+                    }
+
+                    function initializeHexbins(projection, bounds) {
+                        container = initializeSvg();
+                        const points = generateHexagonGrid(bounds, projection);
+                        return createHexbins(points, projection);
+                    }
+
+                    overlay.draw = function() {
+                        const projection = this.getProjection();
+                        const bounds = map.getBounds();
+                        const zoom = map.getZoom();
+
+                        if (currentZoom !== zoom || !hexbins) {
+                            currentZoom = zoom;
+                            clearMap();
+                            hexbins = initializeHexbins(projection, bounds);
+                        }
+
+                        if (!svg || !container || !hexbins) return;
+
+                        const topRight = projection.fromLatLngToDivPixel(bounds.getNorthEast());
+                        const bottomLeft = projection.fromLatLngToDivPixel(bounds.getSouthWest());
+                        const sizeX = topRight.x - bottomLeft.x;
+                        const sizeY = bottomLeft.y - topRight.y;
+
+                        svg.attr('width', sizeX + (2 * hexPad))
+                           .attr('height', sizeY + (2 * hexPad))
+                           .style("margin-left", (bottomLeft.x - hexPad) + "px")
+                           .style("margin-top", (topRight.y - hexPad) + "px");
+
+                        const cscale = d3.scale.linear()
+                            .domain([0, 20])
+                            .range(["#00FF00", "#FFA500"]);
+                        
+                        hexbins.forEach(function(bin) {
+                            const pixel = projection.fromLatLngToDivPixel(bin.geoCenter);
+                            bin.x = pixel.x;
+                            bin.y = pixel.y;
+                        });
+
+                        hexagons = container.selectAll(".hexagon")
+                            .data(hexbins);
+
+                        hexagons.enter()
+                            .append("path")
+                            .attr("class", "hexagon")
+                            .attr("stroke", "rgba(0,0,0,0.8)")
+                            .attr("stroke-width", "0.5px");
+
+                        hexagons
+                            .on("mouseover", function(d) {
+                                const hasData = d.containedPoints.some(p => !p.isBackground);
+                                if (!hasData) return;
+
+                                // Remove previous selection
+                                if (selectedHexagon) {
+                                    d3.select(selectedHexagon)
+                                        .classed("selected-hexagon", false);
+                                }
+
+                                // Update selection
+                                selectedHexagon = this;
+                                d3.select(this).classed("selected-hexagon", true);
+
+                                // Update info panel
+                                updateInfoPanel(d);
+                            })
+                            .on("mouseout", function() {
+                                // Keep the selection until another hexagon is hovered
+                            })
+                            .attr("fill", function(d) {
+                                const hasData = d.containedPoints.some(p => !p.isBackground);
+                                if (!hasData) return "rgba(200,200,200,0.1)";
+                                
+                                const avg = d3.median(d.containedPoints.filter(p => !p.isBackground && p.data), 
+                                    p => +p.data.value[3][0]);
+                                return cscale(avg);
+                            })
+                            .attr("opacity", d => d.containedPoints.some(p => !p.isBackground) ? "0.75" : "0.3")
+                            .attr("d", d3.hexbin().radius(hexRadius).hexagon())
+                            .attr("transform", d => `translate(${d.x},${d.y})`);
+
+                        hexagons.exit().remove();
+
+                        container.attr("transform", 
+                            `translate(${-(bottomLeft.x - hexPad)},${-(topRight.y - hexPad)})`);
+
+                        lastZoom = zoom;
+                    };
+
+                    google.maps.event.addListener(map, 'bounds_changed', () => overlay.draw());
+
+                    google.maps.event.addListener(map, 'zoom_changed', function() {
+                        if (zoomTimer) clearTimeout(zoomTimer);
+                        
+                        [100, 750].forEach(delay => {
+                            zoomTimer = setTimeout(() => {
+                                currentZoom = null;
+                                overlay.draw();
+                            }, delay);
+                        });
+                    });
+                };
+
+                overlay.setMap(map);
+            });
+        }
+    </script>
+</body>
+</html>
